@@ -29,6 +29,7 @@ class BLSTM(nn.Module):
         x, hidden = self.lstm(x, hidden)
         if self.linear:
             x = self.linear(x)
+        x, hidden = self.lstm(x)
         return x, hidden
 
 
@@ -84,7 +85,6 @@ class Demucs(nn.Module):
                  max_hidden=10_000,
                  normalize=True,
                  glu=True,
-                 rescale=0.1,
                  floor=1e-3,
                  sample_rate=16_000):
 
@@ -131,10 +131,8 @@ class Demucs(nn.Module):
             hidden = min(int(growth * hidden), max_hidden)
 
         self.lstm = BLSTM(chin, bi=not causal)
-        if rescale:
-            rescale_module(self, reference=rescale)
 
-    def valid_length(self, length):
+    def valid_length(self, length: int):
         """
         Return the nearest valid length to use with the model so that
         there is no time steps left over in a convolutions, e.g. for all
@@ -143,14 +141,14 @@ class Demucs(nn.Module):
         If the mixture has a valid length, the estimated sources
         will have exactly the same length.
         """
-        length = math.ceil(length * self.resample)
+        length2 = int(math.ceil(length * self.resample))
         for idx in range(self.depth):
-            length = math.ceil((length - self.kernel_size) / self.stride) + 1
-            length = max(length, 1)
+            length2 = math.ceil((length2 - self.kernel_size) / self.stride) + 1
+            length2 = max(length2, 1)
         for idx in range(self.depth):
-            length = (length - 1) * self.stride + self.kernel_size
-        length = int(math.ceil(length / self.resample))
-        return int(length)
+            length2 = (length2 - 1) * self.stride + self.kernel_size
+        length2 = int(math.ceil(length2 / self.resample))
+        return int(length2)
 
     @property
     def total_stride(self):
@@ -168,7 +166,7 @@ class Demucs(nn.Module):
             std = 1
         length = mix.shape[-1]
         x = mix
-        x = F.pad(x, (0, self.valid_length(length) - length))
+        x = F.pad(x, (0, self.valid_length(length) - int(length)))
         if self.resample == 2:
             x = upsample2(x)
         elif self.resample == 4:
@@ -237,7 +235,7 @@ class DemucsStreamer:
                  dry=0,
                  num_frames=1,
                  resample_lookahead=64,
-                 resample_buffer=256):
+                 resample_buffer=160):
         device = next(iter(demucs.parameters())).device
         self.demucs = demucs
         self.lstm_state = None
@@ -253,7 +251,6 @@ class DemucsStreamer:
         self.resample_out = th.zeros(demucs.chin, resample_buffer, device=device)
 
         self.frames = 0
-        self.total_time = 0
         self.variance = 0
         self.pending = th.zeros(demucs.chin, 0, device=device)
 
@@ -264,12 +261,7 @@ class DemucsStreamer:
         self._weight = weight.permute(1, 2, 0).contiguous()
 
     def reset_time_per_frame(self):
-        self.total_time = 0
         self.frames = 0
-
-    @property
-    def time_per_frame(self):
-        return self.total_time / self.frames
 
     def flush(self):
         """
@@ -286,7 +278,6 @@ class DemucsStreamer:
         Apply the model to mix using true real time evaluation.
         Normalization is done online as is the resampling.
         """
-        begin = time.time()
         demucs = self.demucs
         resample_buffer = self.resample_buffer
         stride = self.stride
@@ -339,7 +330,6 @@ class DemucsStreamer:
             outs.append(out)
             self.pending = self.pending[:, stride:]
 
-        self.total_time += time.time() - begin
         if outs:
             out = th.cat(outs, 1)
         else:
@@ -438,11 +428,13 @@ def test():
     streamer = DemucsStreamer(demucs, num_frames=args.num_frames)
     out_rt = []
     frame_size = streamer.total_length
+    total_frame_num = 0
     with th.no_grad():
         while x.shape[1] > 0:
             out_rt.append(streamer.feed(x[:, :frame_size]))
             x = x[:, frame_size:]
             frame_size = streamer.demucs.total_stride
+            total_frame_num = total_frame_num + 1
     out_rt.append(streamer.flush())
     out_rt = th.cat(out_rt, 1)
     model_size = sum(p.numel() for p in demucs.parameters()) * 4 / 2**20
@@ -452,6 +444,7 @@ def test():
     print(f"delta batch/streaming: {th.norm(out - out_rt) / th.norm(out):.2%}")
     print(f"initial lag: {initial_lag:.1f}ms, ", end='')
     print(f"stride: {streamer.stride * args.num_frames / sr_ms:.1f}ms")
+    print(f"total frame num: {total_frame_num}", end='')
     print(f"time per frame: {tpf:.1f}ms, ", end='')
     print(f"RTF: {((1000 * streamer.time_per_frame) / (streamer.stride / sr_ms)):.2f}")
     print(f"Total lag with computation: {initial_lag + tpf:.1f}ms")
